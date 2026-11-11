@@ -8,11 +8,9 @@ pipeline {
     }
 
     environment {
-        AWS_REGION = 'eu-west-1'
-        ECR_REPOSITORY = 'gitops-sample-app'
-        GITOPS_REPO_URL = 'https://github.com/Adedayooyetunji/Automated-CI-CD-and-GitOps-Deployment-with-Jenkins-Argo-CD.git'
-        GITOPS_BRANCH = 'gitops/auto'
-        GITOPS_CREDENTIALS_ID = 'gitops-write'
+        APP_IMAGE = 'gitops-sample-app'
+        APP_CONTAINER = 'gitops-sample-app'
+        APP_PORT = '8081'
     }
 
     stages {
@@ -55,48 +53,27 @@ pipeline {
                 expression { env.APP_CHANGED == 'true' }
             }
             steps {
-                sh 'trivy fs --scanners vuln,misconfig,secret --exit-code 1 --severity HIGH,CRITICAL .'
+                sh 'trivy fs --scanners vuln,misconfig,secret --exit-code 1 --severity HIGH,CRITICAL app'
             }
         }
 
-        stage('Build, scan, and push image') {
+        stage('Build and scan image') {
             when {
-                allOf {
-                    branch 'main'
-                    expression { env.APP_CHANGED == 'true' }
-                }
+                expression { env.APP_CHANGED == 'true' }
             }
             steps {
                 script {
                     env.IMAGE_TAG = env.GIT_COMMIT.take(12)
-                    def accountId = sh(
-                        script: 'aws sts get-caller-identity --query Account --output text',
-                        returnStdout: true
-                    ).trim()
-                    env.IMAGE_URI = "${accountId}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${env.ECR_REPOSITORY}"
                 }
                 sh '''
-                    aws ecr get-login-password --region "$AWS_REGION" |
-                        docker login --username AWS --password-stdin \
-                        "$(printf '%s' "$IMAGE_URI" | cut -d/ -f1)"
-                    EXISTING_DIGEST="$(aws ecr batch-get-image \
-                        --repository-name "$ECR_REPOSITORY" \
-                        --image-ids "imageTag=$IMAGE_TAG" \
-                        --query 'images[0].imageId.imageDigest' --output text)"
-                    if [ "$EXISTING_DIGEST" = "None" ]; then
-                        docker build --build-arg "APP_VERSION=$IMAGE_TAG" \
-                            -t "$IMAGE_URI:$IMAGE_TAG" app
-                        trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE_URI:$IMAGE_TAG"
-                        docker push "$IMAGE_URI:$IMAGE_TAG"
-                    else
-                        docker pull "$IMAGE_URI:$IMAGE_TAG"
-                        trivy image --exit-code 1 --severity HIGH,CRITICAL "$IMAGE_URI:$IMAGE_TAG"
-                    fi
+                    docker build --build-arg "APP_VERSION=$IMAGE_TAG" \
+                        -t "$APP_IMAGE:$IMAGE_TAG" app
+                    trivy image --exit-code 1 --severity HIGH,CRITICAL "$APP_IMAGE:$IMAGE_TAG"
                 '''
             }
         }
 
-        stage('Update dev GitOps manifest') {
+        stage('Deploy on EC2') {
             when {
                 allOf {
                     branch 'main'
@@ -104,27 +81,45 @@ pipeline {
                 }
             }
             steps {
-                withCredentials([gitUsernamePassword(
-                    credentialsId: env.GITOPS_CREDENTIALS_ID,
-                    gitToolName: 'Default'
-                )]) {
-                    sh '''
-                        git remote set-url origin "$GITOPS_REPO_URL"
-                        git fetch origin \
-                            "+refs/heads/$GITOPS_BRANCH:refs/remotes/origin/$GITOPS_BRANCH"
-                        git checkout -B "$GITOPS_BRANCH" "origin/$GITOPS_BRANCH"
-                        cd gitops-config/overlays/dev
-                        kustomize edit set image "sample-app=$IMAGE_URI:$IMAGE_TAG"
-                        cd ../../..
-                        git add gitops-config/overlays/dev/kustomization.yaml
-                        if ! git diff --cached --quiet; then
-                            git config user.name "Jenkins"
-                            git config user.email "jenkins@users.noreply.github.com"
-                            git commit -m "Deploy dev image $IMAGE_TAG"
-                            git push origin "HEAD:refs/heads/$GITOPS_BRANCH"
+                sh '''
+                    set -eu
+                    previous_image="$(docker inspect --format='{{.Config.Image}}' "$APP_CONTAINER" 2>/dev/null || true)"
+
+                    docker rm --force "$APP_CONTAINER" >/dev/null 2>&1 || true
+                    docker run --detach \
+                        --name "$APP_CONTAINER" \
+                        --restart unless-stopped \
+                        --publish "$APP_PORT:8080" \
+                        --env APP_ENV=prod \
+                        "gitops-sample-app:$IMAGE_TAG"
+
+                    attempt=0
+                    while [ "$attempt" -lt 30 ]; do
+                        status="$(docker inspect --format='{{.State.Health.Status}}' "$APP_CONTAINER" 2>/dev/null || printf 'missing')"
+                        if [ "$status" = "healthy" ]; then
+                            echo "Deployed $APP_IMAGE:$IMAGE_TAG on port $APP_PORT"
+                            exit 0
                         fi
-                    '''
-                }
+                        if [ "$status" = "unhealthy" ] || [ "$status" = "missing" ]; then
+                            break
+                        fi
+                        attempt=$((attempt + 1))
+                        sleep 2
+                    done
+
+                    docker logs "$APP_CONTAINER" || true
+                    docker rm --force "$APP_CONTAINER" >/dev/null 2>&1 || true
+                    if [ -n "$previous_image" ]; then
+                        echo "Deployment health check failed; restoring $previous_image"
+                        docker run --detach \
+                            --name "$APP_CONTAINER" \
+                            --restart unless-stopped \
+                            --publish "$APP_PORT:8080" \
+                            --env APP_ENV=prod \
+                            "$previous_image"
+                    fi
+                    exit 1
+                '''
             }
         }
     }
