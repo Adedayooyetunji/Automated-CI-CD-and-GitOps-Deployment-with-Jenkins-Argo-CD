@@ -1,0 +1,6 @@
+aws_region                          = "eu-west-1"
+cluster_name                        = "gitops-eks"
+cluster_version                     = "REPLACE_WITH_SUPPORTED_VERSION"
+cluster_endpoint_public_access_cidrs = ["REPLACE_WITH_YOUR_PUBLIC_IP/32"]
+node_instance_types                 = ["t3.medium"]
+node_desired_size                   = 2
